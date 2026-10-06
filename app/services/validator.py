@@ -16,19 +16,24 @@ def validate_recipient(
 
     Checks:
     1. Non-blank name.
-    2. String length bounds (name, email, role, score).
-    3. Valid email address syntax.
-    4. Duplicate email within the current request batch.
+    2. Non-blank email.
+    3. String length bounds (name, email, role, score).
+    4. Valid email address syntax.
+    5. Duplicate email within the current request batch.
 
     Returns:
         (True, None) if valid.
         (False, error_reason) if invalid.
     """
-    # 1. Blank name check
+    # 1. Blank or missing name check
     if not recipient.name or not recipient.name.strip():
         return False, "Recipient name cannot be blank."
 
-    # 2. Over-long string limits
+    # 2. Blank or missing email check
+    if not recipient.email or not recipient.email.strip():
+        return False, "Recipient email cannot be blank."
+
+    # 3. Over-long string limits
     if len(recipient.name) > MAX_STRING_LENGTH:
         return False, f"Recipient name exceeds maximum allowed length ({MAX_STRING_LENGTH} characters)."
 
@@ -38,50 +43,22 @@ def validate_recipient(
     if recipient.role and len(recipient.role) > MAX_STRING_LENGTH:
         return False, f"Role exceeds maximum allowed length ({MAX_STRING_LENGTH} characters)."
 
-    if recipient.score and len(recipient.score) > MAX_SCORE_LENGTH:
+    if recipient.score and len(str(recipient.score)) > MAX_SCORE_LENGTH:
         return False, f"Score exceeds maximum allowed length ({MAX_SCORE_LENGTH} characters)."
 
-    # 3. Email format validation
+    # 4. Email format validation
     stripped_email = recipient.email.strip()
     try:
         validated = validate_email(stripped_email, check_deliverability=False)
         normalized_email = validated.normalized.lower()
-    except (EmailNotValidError, Exception) as exc:
+    except EmailNotValidError as exc:
         return False, f"Invalid email address: {str(exc)}"
 
-    # 4. Duplicate email check within the request batch
+    # 5. Duplicate email check within the request batch (case-insensitive)
     if normalized_email in seen_emails:
         return False, f"Duplicate email address '{recipient.email}' within this request batch."
 
     # Record email to prevent future duplicates in the batch
     seen_emails.add(normalized_email)
 
-    return True, None
-
-
-def is_eligible_for_generation(
-    name: str,
-    email: str,
-    role: Optional[str] = None,
-    score: Optional[str] = None,
-) -> Tuple[bool, Optional[str]]:
-    """Check if recipient attributes meet basic validity criteria to attempt PDF generation.
-
-    Distinguishes permanent validation failures (e.g. blank name or malformed email)
-    from transient system errors.
-    """
-    if not name or not name.strip():
-        return False, "Recipient name cannot be blank."
-    if len(name) > MAX_STRING_LENGTH:
-        return False, f"Recipient name exceeds {MAX_STRING_LENGTH} characters."
-    if not email or len(email) > MAX_STRING_LENGTH:
-        return False, f"Email exceeds {MAX_STRING_LENGTH} characters."
-    if role and len(role) > MAX_STRING_LENGTH:
-        return False, f"Role exceeds {MAX_STRING_LENGTH} characters."
-    if score and len(score) > MAX_SCORE_LENGTH:
-        return False, f"Score exceeds {MAX_SCORE_LENGTH} characters."
-    try:
-        validate_email(email.strip(), check_deliverability=False)
-    except Exception as exc:
-        return False, f"Invalid email address: {str(exc)}"
     return True, None

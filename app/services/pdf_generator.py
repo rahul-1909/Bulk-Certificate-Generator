@@ -61,7 +61,7 @@ def generate_certificate_pdf(
     file_path = (target_dir / filename).resolve()
 
     # Security check: guarantee file resides within target directory (no traversal)
-    if not str(file_path).startswith(str(target_dir)):
+    if not file_path.is_relative_to(target_dir):
         raise ValueError("Invalid filename: path traversal attempt detected.")
 
     # A4 Landscape dimensions in points (841.89 x 595.27)
@@ -108,13 +108,18 @@ def generate_certificate_pdf(
     pdf.setFont("Helvetica", 12)
     pdf.drawCentredString(width / 2, height - 170, "THIS CERTIFICATE IS PROUDLY PRESENTED TO")
 
-    # 6. Recipient Name
+    # 6. Recipient Name (auto-scaled to fit landscape bounds without overflow)
+    max_name_width = width - 160
+    font_size = 26
+    while font_size > 12 and pdf.stringWidth(recipient_name, "Helvetica-Bold", font_size) > max_name_width:
+        font_size -= 2
+
     pdf.setFillColor(colors.HexColor("#1A202C"))
-    pdf.setFont("Helvetica-Bold", 26)
+    pdf.setFont("Helvetica-Bold", font_size)
     pdf.drawCentredString(width / 2, height - 220, recipient_name)
 
     # Underline below recipient name
-    name_width = pdf.stringWidth(recipient_name, "Helvetica-Bold", 26)
+    name_width = pdf.stringWidth(recipient_name, "Helvetica-Bold", font_size)
     line_start = (width - min(name_width + 40, width - 200)) / 2
     line_end = line_start + min(name_width + 40, width - 200)
     pdf.setStrokeColor(colors.HexColor("#D69E2E"))

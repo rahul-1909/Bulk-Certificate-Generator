@@ -302,18 +302,19 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
 ## 9. Design Decisions
 
 ### 1. Framework Choice: FastAPI
-- **Rationale**: FastAPI is selected for its native asynchronous capabilities, automatic OpenAPI/Swagger documentation, high throughput with ASGI/Uvicorn, and seamless integration with Pydantic v2 for data validation.
+- **Rationale**: FastAPI is selected for its high developer ergonomics, automatic OpenAPI/Swagger documentation, and seamless integration with Pydantic v2.
+- **Execution Model**: The endpoints and background tasks perform CPU- and file-I/O-intensive operations (ReportLab PDF generation and SQLite database writes). Endpoints are implemented as standard `def` functions, which FastAPI automatically executes in a separate thread pool (via AnyIO/Starlette), preventing synchronous disk and database I/O from blocking the primary async event loop.
 
 ### 2. Database Choice & Schema
-- **Relational ORM**: SQLAlchemy 2.0 with standard 2.0 declarative syntax (`DeclarativeBase`, typed session queries).
-- **Default Database**: SQLite by default (`sqlite:///./certificates.db`) with `check_same_thread=False` to allow concurrent background worker access. The connection string is completely driven by the `DATABASE_URL` environment variable, enabling direct drops into PostgreSQL without code modification.
+- **Relational ORM**: SQLAlchemy 2.0 using modern 2.0 declarative models (`DeclarativeBase`) and 2.0 style queries (`db.scalars(select(...))`).
+- **Default Database**: SQLite by default (`sqlite:///./certificates.db`) with `check_same_thread=False` and WAL mode enabled (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) to eliminate write lock contention. Driven entirely by the `DATABASE_URL` environment variable, enabling direct drops into PostgreSQL without code modification.
 - **Table Creation vs. Alembic Migrations**:
   - Clean table initialization on startup (`Base.metadata.create_all`) is selected.
   - *Justification*: For a self-contained, domain-focused service with an established schema, running `create_all` during FastAPI's application lifespan provides zero-friction deployment with zero external CLI orchestration needed for initial boots.
   - *Production Path*: For multi-instance, rolling-update production deployments, Alembic migrations should be used alongside CI/CD release phases to manage backward-compatible column migrations and index creations.
 - **Schema Design**:
   - `jobs`: Stores batch-level attributes (`title`, `issuer`, `issue_date`), state enum (`pending`, `processing`, `completed`, `completed_with_errors`, `failed`), live counters (`total_count`, `succeeded_count`, `failed_count`, `pending_count`), and timestamps.
-  - `certificate_recipients`: Foreign key relation back to `jobs.id` with `ondelete="CASCADE"`. Stores recipient details (`name`, `email`, `role`, `score`), per-item status (`pending`, `success`, `failed`), `error_message`, generated file path, and timestamps.
+  - `certificate_recipients`: Foreign key relation back to `jobs.id` with `ondelete="CASCADE"`. Stores recipient details (`name`, `email`, `role`, `score`), per-item status (`pending`, `success`, `failed`), explicit `failure_type` (`validation` or `generation`), `error_message`, generated file path, and timestamps.
 
 ### 3. Synchronous vs. Background Processing & Why
 - **Chosen Mechanism**: FastAPI `BackgroundTasks` triggered upon request acceptance.
@@ -325,14 +326,14 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
   - A dedicated context manager `with get_db_session() as db:` creates an independent database session for the background thread, avoiding session concurrency violations and connection pool leaks.
 - **Limitations**:
   - In-process background tasks run in the memory of the web server worker. If the container or server process restarts during execution, jobs currently in the `processing` state will remain in that state and will not automatically resume on boot.
-  - However, the job is not permanently broken: calling `POST /api/v1/jobs/{job_id}/retry` inspects the job, finds any interrupted recipients left in `pending`, and safely resumes generation.
+  - However, interrupted jobs can be resumed via `/retry`: calling `POST /api/v1/jobs/{job_id}/retry` inspects the job, finds any interrupted recipients left in `pending`, and safely resumes generation.
 - **Production Architecture**:
   - In a high-volume production environment, we recommend an external distributed task queue such as **Celery** or **Temporal** backed by **Redis** or **RabbitMQ**. Tasks can be partitioned into recipient chunks, worker nodes can scale horizontally, and lost tasks can be automatically redelivered using visibility timeouts and worker heartbeats.
 
 ### 4. Failure Isolation
 - **Per-Recipient Fault Boundaries**:
   - Every recipient is evaluated and processed inside an isolated `try...except Exception` block.
-  - If PDF compilation fails (e.g., unexpected character encoding, disk I/O glitch, or mocked rendering failure), only that specific recipient is flagged with `status="failed"` and the exact error recorded in `error_message`.
+  - If PDF compilation fails (e.g., unexpected character encoding, disk I/O glitch, or mocked rendering failure), only that specific recipient is flagged with `status="failed"`, `failure_type="generation"`, and a client-safe generic error message recorded in `error_message` while full diagnostics are logged server-side.
   - The loop continues immediately to the next recipient.
 - **Terminal Job States**:
   - `completed`: All recipients generated successfully (`failed_count == 0`).
@@ -342,25 +343,27 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
 ### 5. Validation Strategy
 - **Two-Tier Validation**:
   1. *Request-level*: Validates structural integrity (missing title, issuer, issue date, empty recipient list, payload size exceeding `MAX_RECIPIENTS_PER_JOB`). Failures return `422 Unprocessable Content`.
-  2. *Per-recipient level*: Evaluates individual business constraints (blank names, invalid email syntax via `email_validator`, string lengths exceeding 255 characters, and duplicate emails within the same request batch).
-  - *Non-Rejection Policy*: Per-recipient validation issues do NOT abort the batch; invalid records are inserted into the database as `failed` with diagnostic messages, and valid records are queued for generation.
+  2. *Per-recipient level*: Evaluates individual business constraints (missing/blank names, missing/blank emails, invalid email syntax via `email_validator`, string lengths exceeding 255 characters, and duplicate emails within the same request batch).
+  - *Non-Rejection Policy*: Per-recipient validation issues do NOT abort the batch; invalid records are inserted into the database as `failed` with `failure_type="validation"` and diagnostic messages, and valid records are queued for generation.
+  - *Database Truncation Guard*: To guarantee drop-in compatibility with PostgreSQL and prevent string-length crashes, all stored recipient fields are truncated to column maximums before saving to the database.
 
-### 6. File Storage & Path Traversal Security
+### 6. File Storage, Layout & Path Traversal Security
 - **Directory**: Configurable via `CERTIFICATES_STORAGE_DIR` (defaults to `./storage/certificates`).
-- **Sanitization**: Names are sanitized to alphanumeric, dash, and underscore characters (`re.sub(r"[^\w\-]", "_", ...)`).
-- **Security Guardrail**: The resolved target path is checked to guarantee that it is strictly located within the configured storage directory, preventing directory traversal (`../../`).
-- **Cleanup & Streaming**: ZIP retrieval aggregates files directly from storage into an in-memory streaming archive without temporary file clutter.
+- **Sanitization & Traversal Guard**: Names are sanitized to alphanumeric, dash, and underscore characters (`re.sub(r"[^\w\-]", "_", ...)`). The target path is verified using Python 3.11's `file_path.is_relative_to(target_dir)` to prevent directory traversal (`../../`).
+- **PDF Layout & Typography**: Recipient names are auto-scaled dynamically if long so they fit within the A4 landscape borders without overflowing. Note: The predefined template uses ReportLab's standard Helvetica font; rendering non-Latin scripts (e.g. Telugu, Devanagari, Arabic, CJK) requires registering a TrueType Unicode font such as Google Noto Sans.
+- **ZIP Packaging**: ZIP archives are assembled in memory using Python's `zipfile` module. For multi-gigabyte production archives, an asynchronous disk-spooled stream would be preferred to constrain peak memory usage.
 
 ### 7. Idempotency, Re-runnability & Retry Strategy
-- Before generating a certificate, the processor verifies if the recipient already has a valid non-empty PDF file on disk. If so, it marks the recipient as successful without regenerating.
-- The `POST /api/v1/jobs/{job_id}/retry` endpoint provides intentional, resilient recovery:
+- The primary protection against duplicate work is processing only `pending` rows with deterministic file paths (`{recipient_id}_{safe_name}.pdf`). If a recipient already has a valid file on disk, it is verified rather than regenerated.
+- The `POST /api/v1/jobs/{job_id}/retry` endpoint provides intentional recovery:
+  - **Active Job Guard**: Returns `409 Conflict` if the job is actively being processed and updated within the last 5 minutes, preventing double-counting and duplicate workers.
   - **Interrupted Pending Recipients**: Resumes generation for any recipients left in `pending` (such as after an unexpected server restart or container kill).
-  - **Transient Generation Failures**: Identifies recipients that failed due to transient system or rendering errors, resets their status to `pending`, and queues regeneration.
-  - **Permanent Validation Failures**: Excludes permanently invalid recipients (e.g., blank name or invalid email format). Because their underlying input is invalid, re-attempting generation would merely produce a blank or corrupt certificate, so they remain `failed` with their validation reason intact.
+  - **Transient Generation Failures**: Identifies recipients that failed due to transient system or rendering errors (`failure_type == "generation"`), resets their status to `pending`, and queues regeneration.
+  - **Permanent Validation Failures**: Excludes permanently invalid recipients (`failure_type == "validation"`, such as duplicate emails, blank names, or invalid email syntax). They remain `failed` with their original reason intact.
 
 ### 8. What I Would Improve in Production
-1. **Distributed Task Queue**: Replace in-process `BackgroundTasks` with Celery or Temporal backed by Redis/RabbitMQ.
+1. **Distributed Task Queue**: Replace in-process `BackgroundTasks` with Celery or Temporal backed by Redis/RabbitMQ with worker heartbeats and dead-letter queues.
 2. **Object Storage**: Store certificates in AWS S3 or Google Cloud Storage with pre-signed download URLs rather than local block storage.
-3. **Template Engine**: Add SVG or HTML-to-PDF rendering (e.g. WeasyPrint) with configurable dynamic certificate templates.
+3. **Template Engine**: Add SVG or HTML-to-PDF rendering (e.g. WeasyPrint) with configurable dynamic certificate templates and full Unicode font support.
 4. **Rate Limiting & Authentication**: Enforce API Key / JWT authentication and rate limits per tenant.
 5. **Observability**: Export OpenTelemetry metrics (job latency, queue depth, PDF generation rate) and integrate Prometheus/Grafana dashboards.

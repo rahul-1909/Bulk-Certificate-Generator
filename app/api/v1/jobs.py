@@ -1,8 +1,10 @@
 """API endpoints for managing certificate generation jobs."""
 
 import math
+from datetime import datetime, timedelta, timezone
 from typing import Set
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db
@@ -20,6 +22,8 @@ from app.services.validator import validate_recipient
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
+
+STALE_AFTER = timedelta(minutes=5)
 
 
 @router.post(
@@ -64,26 +68,34 @@ def create_job(
     for rec_in in payload.recipients:
         is_valid, error_reason = validate_recipient(rec_in, seen_emails)
 
+        # Truncate stored values to column maximums to ensure clean PostgreSQL compatibility
+        clean_name = (rec_in.name or "").strip()[:255]
+        clean_email = (rec_in.email or "").strip()[:255]
+        clean_role = rec_in.role.strip()[:255] if rec_in.role else None
+        clean_score = str(rec_in.score).strip()[:100] if rec_in.score is not None else None
+
         if is_valid:
             valid_recipients_count += 1
             recipient = CertificateRecipient(
                 job_id=job.id,
-                name=rec_in.name.strip(),
-                email=rec_in.email.strip(),
-                role=rec_in.role.strip() if rec_in.role else None,
-                score=rec_in.score.strip() if rec_in.score else None,
+                name=clean_name,
+                email=clean_email,
+                role=clean_role,
+                score=clean_score,
                 status=CertificateStatus.PENDING,
+                failure_type=None,
                 error_message=None,
             )
         else:
             invalid_recipients_count += 1
             recipient = CertificateRecipient(
                 job_id=job.id,
-                name=rec_in.name.strip() if rec_in.name else "",
-                email=rec_in.email.strip() if rec_in.email else "",
-                role=rec_in.role.strip() if rec_in.role else None,
-                score=rec_in.score.strip() if rec_in.score else None,
+                name=clean_name,
+                email=clean_email,
+                role=clean_role,
+                score=clean_score,
                 status=CertificateStatus.FAILED,
+                failure_type="validation",
                 error_message=error_reason,
             )
         db.add(recipient)
@@ -151,24 +163,25 @@ def get_job(
             detail=f"Job with ID '{job_id}' not found.",
         )
 
-    # Count total recipients
-    total_recipients = (
-        db.query(CertificateRecipient)
-        .filter(CertificateRecipient.job_id == job_id)
-        .count()
+    # Count total recipients using SQLAlchemy 2.0 select
+    count_stmt = (
+        select(func.count())
+        .select_from(CertificateRecipient)
+        .where(CertificateRecipient.job_id == job_id)
     )
+    total_recipients = db.scalar(count_stmt) or 0
     total_pages = max(1, math.ceil(total_recipients / page_size))
 
     # Paginate recipients
     offset = (page - 1) * page_size
-    recipients_query = (
-        db.query(CertificateRecipient)
-        .filter(CertificateRecipient.job_id == job_id)
+    recipients_stmt = (
+        select(CertificateRecipient)
+        .where(CertificateRecipient.job_id == job_id)
         .order_by(CertificateRecipient.created_at)
         .offset(offset)
         .limit(page_size)
-        .all()
     )
+    recipients_query = list(db.scalars(recipients_stmt).all())
 
     recipient_items = []
     for r in recipients_query:
@@ -185,6 +198,7 @@ def get_job(
                 role=r.role,
                 score=r.score,
                 status=r.status,
+                failure_type=r.failure_type,
                 error_message=r.error_message,
                 download_url=download_url,
                 created_at=r.created_at,
@@ -217,7 +231,7 @@ def get_job(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Retry failed certificates for a job",
     description=(
-        "Resets failed certificates that suffered transient errors to pending, "
+        "Resets failed certificates that suffered transient generation errors to pending, "
         "resumes any interrupted pending recipients (e.g. after server restart), "
         "and queues regeneration while preserving permanent validation errors."
     ),
@@ -227,9 +241,7 @@ def retry_failed_certificates(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> JobRetryResponse:
-    """Reset transiently failed recipients and resume pending ones after interruption."""
-    from app.services.validator import is_eligible_for_generation
-
+    """Reset transient generation failures and resume pending recipients after interruption."""
     settings = get_settings()
     job = db.get(Job, job_id)
     if not job:
@@ -238,45 +250,50 @@ def retry_failed_certificates(
             detail=f"Job with ID '{job_id}' not found.",
         )
 
-    # 1. Check for recipients left in pending status (e.g. if worker was interrupted mid-job by a crash)
-    stuck_pending_recipients = (
-        db.query(CertificateRecipient)
-        .filter(
-            CertificateRecipient.job_id == job_id,
-            CertificateRecipient.status == CertificateStatus.PENDING,
+    # Staleness check: prevent duplicate workers if the job is actively being processed
+    updated = job.updated_at
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    is_active = job.status in (JobStatus.PENDING, JobStatus.PROCESSING)
+    if is_active and (datetime.now(timezone.utc) - updated) < STALE_AFTER:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Job is currently being processed. Retry once it finishes or becomes stale.",
         )
-        .all()
+
+    # 1. Stuck pending recipients (e.g. if worker crashed mid-job)
+    stuck_stmt = select(CertificateRecipient).where(
+        CertificateRecipient.job_id == job_id,
+        CertificateRecipient.status == CertificateStatus.PENDING,
     )
+    stuck_pending_recipients = list(db.scalars(stuck_stmt).all())
 
-    # 2. Check for failed recipients whose data is valid (i.e. transient generation errors)
-    all_failed_recipients = (
-        db.query(CertificateRecipient)
-        .filter(
-            CertificateRecipient.job_id == job_id,
-            CertificateRecipient.status == CertificateStatus.FAILED,
-        )
-        .all()
+    # 2. Transient generation failures only
+    gen_failed_stmt = select(CertificateRecipient).where(
+        CertificateRecipient.job_id == job_id,
+        CertificateRecipient.status == CertificateStatus.FAILED,
+        CertificateRecipient.failure_type == "generation",
     )
+    generation_failed_recipients = list(db.scalars(gen_failed_stmt).all())
 
-    eligible_to_retry = []
-    permanently_invalid_count = 0
-    for r in all_failed_recipients:
-        is_eligible, _ = is_eligible_for_generation(r.name, r.email, r.role, r.score)
-        if is_eligible:
-            eligible_to_retry.append(r)
-        else:
-            permanently_invalid_count += 1
+    # 3. Permanent validation failures (remain failed)
+    val_failed_stmt = select(CertificateRecipient).where(
+        CertificateRecipient.job_id == job_id,
+        CertificateRecipient.status == CertificateStatus.FAILED,
+        CertificateRecipient.failure_type == "validation",
+    )
+    permanently_invalid_count = len(list(db.scalars(val_failed_stmt).all()))
 
-    total_to_process = len(stuck_pending_recipients) + len(eligible_to_retry)
+    total_to_process = len(stuck_pending_recipients) + len(generation_failed_recipients)
 
     if total_to_process == 0:
         if permanently_invalid_count > 0:
             msg = (
                 f"No retryable certificates found. {permanently_invalid_count} recipient(s) "
-                f"failed permanent validation (blank name or invalid email) and cannot be generated."
+                f"failed permanent validation (blank name, invalid email, or duplicate) and cannot be generated."
             )
         else:
-            msg = "No pending or failed certificates to retry for this job."
+            msg = "No failed certificates to retry for this job."
         return JobRetryResponse(
             job_id=job.id,
             status=job.status,
@@ -284,12 +301,12 @@ def retry_failed_certificates(
             message=msg,
         )
 
-    # Reset eligible failed recipients to pending
-    for r in eligible_to_retry:
+    # Reset eligible generation failures to pending
+    for r in generation_failed_recipients:
         r.status = CertificateStatus.PENDING
+        r.failure_type = None
         r.error_message = None
 
-    # Recalculate pending and failed counts
     job.pending_count = total_to_process
     job.failed_count = permanently_invalid_count
     job.status = JobStatus.PENDING

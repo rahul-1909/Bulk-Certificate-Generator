@@ -56,7 +56,8 @@ def test_individual_pdf_generation_failure_isolated(
     assert recipients_by_name["Solid User B"]["error_message"] is None
     assert recipients_by_name["Solid User B"]["download_url"] is not None
 
-    # Faulty user must fail with simulated error captured
+    # Faulty user must fail with failure_type=generation and safe error message
     assert recipients_by_name["Faulty User"]["status"] == "failed"
+    assert recipients_by_name["Faulty User"]["failure_type"] == "generation"
     assert recipients_by_name["Faulty User"]["download_url"] is None
-    assert "Simulated ReportLab disk rendering failure" in recipients_by_name["Faulty User"]["error_message"]
+    assert "rendering or storage error" in recipients_by_name["Faulty User"]["error_message"].lower()

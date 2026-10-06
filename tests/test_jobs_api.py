@@ -178,8 +178,8 @@ def test_per_recipient_validation_mixed_batch(client: TestClient):
     assert rec_by_name["Duplicate Copy"]["status"] == "failed"
     assert "duplicate" in rec_by_name["Duplicate Copy"]["error_message"].lower()
 
-    assert rec_by_name[long_name]["status"] == "failed"
-    assert "exceeds maximum allowed length" in rec_by_name[long_name]["error_message"].lower()
+    assert rec_by_name[long_name[:255]]["status"] == "failed"
+    assert "exceeds maximum allowed length" in rec_by_name[long_name[:255]]["error_message"].lower()
 
 
 def test_batch_all_recipients_invalid(client: TestClient):
@@ -208,3 +208,97 @@ def test_batch_all_recipients_invalid(client: TestClient):
     assert get_res.status_code == 200
     assert get_res.json()["status"] == "failed"
     assert get_res.json()["failed_count"] == 2
+
+
+def test_numeric_score_accepted(client: TestClient):
+    """Verify that integer and float scores are coerced to strings without request-level 422."""
+    payload = {
+        "title": "Numeric Score Cohort",
+        "issuer": "Academy",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": "Student A", "email": "a@example.com", "score": 96},
+            {"name": "Student B", "email": "b@example.com", "score": 88.5},
+        ],
+    }
+    response = client.post("/api/v1/jobs", json=payload)
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    get_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert get_res.status_code == 200
+    recipients = get_res.json()["recipients"]
+    assert recipients[0]["score"] == "96"
+    assert recipients[1]["score"] == "88.5"
+    assert recipients[0]["status"] == "success"
+    assert recipients[1]["status"] == "success"
+
+
+def test_duplicate_email_case_insensitive(client: TestClient):
+    """Verify duplicate detection treats mixed-case email addresses as duplicates."""
+    payload = {
+        "title": "Case Duplicate Test",
+        "issuer": "Issuer",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": "First Entry", "email": "Scholar@Example.COM"},
+            {"name": "Second Entry", "email": "scholar@example.com"},
+        ],
+    }
+    response = client.post("/api/v1/jobs", json=payload)
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    get_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert get_res.status_code == 200
+    recipients = get_res.json()["recipients"]
+    assert recipients[0]["status"] == "success"
+    assert recipients[1]["status"] == "failed"
+    assert "duplicate" in recipients[1]["error_message"].lower()
+
+
+def test_missing_or_null_fields_per_recipient(client: TestClient):
+    """Verify null or omitted name/email marks that recipient failed without 422 for whole batch."""
+    payload = {
+        "title": "Partial Batch",
+        "issuer": "Issuer",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": None, "email": "valid1@example.com"},  # Null name
+            {"email": "valid2@example.com"},                # Missing name
+            {"name": "Valid Person", "email": "valid3@example.com"},  # Valid
+        ],
+    }
+    response = client.post("/api/v1/jobs", json=payload)
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    get_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert get_res.status_code == 200
+    job_data = get_res.json()
+    assert job_data["succeeded_count"] == 1
+    assert job_data["failed_count"] == 2
+
+
+def test_overlong_field_stored_safely_and_failed(client: TestClient):
+    """Verify over-long string is safely truncated for storage and marked as validation failure."""
+    overlong_name = "N" * 500
+    payload = {
+        "title": "Overlong Cohort",
+        "issuer": "Issuer",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": overlong_name, "email": "overlong@example.com"},
+        ],
+    }
+    response = client.post("/api/v1/jobs", json=payload)
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    get_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert get_res.status_code == 200
+    rec = get_res.json()["recipients"][0]
+    assert rec["status"] == "failed"
+    assert rec["failure_type"] == "validation"
+    assert len(rec["name"]) == 255  # Truncated cleanly for DB storage
+    assert "exceeds maximum allowed length" in rec["error_message"].lower()

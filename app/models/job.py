@@ -107,6 +107,7 @@ class CertificateRecipient(Base):
         default=CertificateStatus.PENDING,
         index=True,
     )
+    failure_type = Column(String(50), nullable=True, index=True)
     error_message = Column(Text, nullable=True)
     certificate_file_path = Column(String(512), nullable=True)
 

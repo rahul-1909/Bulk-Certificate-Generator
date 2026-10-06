@@ -74,7 +74,7 @@ def test_retry_when_no_failed_certificates(client: TestClient):
     retry_res = client.post(f"/api/v1/jobs/{job_id}/retry")
     assert retry_res.status_code == 202
     assert retry_res.json()["retried_count"] == 0
-    assert "no pending or failed certificates to retry" in retry_res.json()["message"].lower()
+    assert "no failed certificates to retry" in retry_res.json()["message"].lower()
 
 
 def test_retry_non_existent_job(client: TestClient):
@@ -138,10 +138,11 @@ def test_retry_resumes_interrupted_pending_recipients(client: TestClient):
             .first()
         )
         rec.status = CertificateStatus.PENDING
-        rec.certificate_file_path = None
+        from datetime import datetime, timedelta, timezone
         job_obj.succeeded_count = 1
         job_obj.pending_count = 1
         job_obj.status = JobStatus.PROCESSING
+        job_obj.updated_at = datetime.now(timezone.utc) - timedelta(minutes=10)
         db.commit()
 
     # Call retry
@@ -155,3 +156,62 @@ def test_retry_resumes_interrupted_pending_recipients(client: TestClient):
     assert job_res.json()["status"] == "completed"
     assert job_res.json()["succeeded_count"] == 2
     assert job_res.json()["pending_count"] == 0
+
+
+def test_retry_duplicate_recipient_stays_failed(client: TestClient):
+    """Verify that a duplicate-email recipient is marked validation failure and stays failed on retry."""
+    payload = {
+        "title": "Duplicate Retry Test",
+        "issuer": "Issuer",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": "Original", "email": "same@example.com"},
+            {"name": "Duplicate", "email": "same@example.com"},
+        ],
+    }
+    create_res = client.post("/api/v1/jobs", json=payload)
+    job_id = create_res.json()["job_id"]
+
+    # Verify initial status: 1 success, 1 failed
+    job_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert job_res.status_code == 200
+    assert job_res.json()["succeeded_count"] == 1
+    assert job_res.json()["failed_count"] == 1
+
+    # Retry must refuse to re-generate the permanent duplicate validation failure
+    retry_res = client.post(f"/api/v1/jobs/{job_id}/retry")
+    assert retry_res.status_code == 202
+    assert retry_res.json()["retried_count"] == 0
+
+    # Status remains unchanged
+    updated_res = client.get(f"/api/v1/jobs/{job_id}")
+    assert updated_res.status_code == 200
+    assert updated_res.json()["succeeded_count"] == 1
+    assert updated_res.json()["failed_count"] == 1
+
+
+def test_retry_on_active_processing_job_returns_409(client: TestClient):
+    """Verify calling /retry on an actively processing, non-stale job returns 409 Conflict."""
+    from datetime import datetime, timezone
+    from app.core.db import get_db_session
+    from app.models.job import Job, JobStatus
+
+    payload = {
+        "title": "Active Job",
+        "issuer": "Issuer",
+        "issue_date": "2026-10-07",
+        "recipients": [{"name": "User", "email": "user@example.com"}],
+    }
+    create_res = client.post("/api/v1/jobs", json=payload)
+    job_id = create_res.json()["job_id"]
+
+    # Mark job as actively processing with current timestamp
+    with get_db_session() as db:
+        job = db.get(Job, job_id)
+        job.status = JobStatus.PROCESSING
+        job.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+    retry_res = client.post(f"/api/v1/jobs/{job_id}/retry")
+    assert retry_res.status_code == 409
+    assert "currently being processed" in retry_res.json()["detail"].lower()

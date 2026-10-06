@@ -2,6 +2,7 @@
 
 import os
 from datetime import datetime, timezone
+from sqlalchemy import select
 from app.core.db import get_db_session
 from app.core.logging import get_logger
 from app.models.job import CertificateRecipient, CertificateStatus, Job, JobStatus
@@ -19,7 +20,7 @@ def process_job_background(job_id: str) -> None:
     3. Iterates over all pending recipients independently.
     4. Commits progress per recipient so real-time status is queryable.
     5. Isolates failures: an unhandled exception for one recipient marks that recipient
-       as 'failed' and records the error message, while allowing all other recipients to proceed.
+       as 'failed' with failure_type='generation', avoiding raw exception leakage.
     6. Is completely idempotent and re-runnable: skips recreation if a valid certificate
        already exists on disk, and can be safely reinvoked on retries.
     7. Updates the final job status to 'completed', 'completed_with_errors', or 'failed'.
@@ -32,16 +33,16 @@ def process_job_background(job_id: str) -> None:
             logger.warning("Job %s not found in database. Aborting processing.", job_id)
             return
 
-        # Fetch all pending recipients
-        pending_recipients = (
-            db.query(CertificateRecipient)
-            .filter(
+        # Fetch all pending recipients using SQLAlchemy 2.0 select
+        stmt = (
+            select(CertificateRecipient)
+            .where(
                 CertificateRecipient.job_id == job_id,
                 CertificateRecipient.status == CertificateStatus.PENDING,
             )
             .order_by(CertificateRecipient.created_at)
-            .all()
         )
+        pending_recipients = list(db.scalars(stmt).all())
 
         if not pending_recipients:
             logger.info("No pending recipients to process for job %s", job_id)
@@ -69,6 +70,7 @@ def process_job_background(job_id: str) -> None:
                     and os.path.getsize(recipient.certificate_file_path) > 0
                 ):
                     recipient.status = CertificateStatus.SUCCESS
+                    recipient.failure_type = None
                     recipient.error_message = None
                     job.succeeded_count += 1
                 else:
@@ -84,6 +86,7 @@ def process_job_background(job_id: str) -> None:
                     )
                     recipient.certificate_file_path = pdf_path
                     recipient.status = CertificateStatus.SUCCESS
+                    recipient.failure_type = None
                     recipient.error_message = None
                     job.succeeded_count += 1
 
@@ -95,7 +98,10 @@ def process_job_background(job_id: str) -> None:
                     str(exc),
                 )
                 recipient.status = CertificateStatus.FAILED
-                recipient.error_message = str(exc)
+                recipient.failure_type = "generation"
+                recipient.error_message = (
+                    "Certificate generation failed due to an internal rendering or storage error."
+                )
                 job.failed_count += 1
 
             finally:

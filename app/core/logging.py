@@ -1,8 +1,25 @@
-"""Structured logging configuration for Bulk Certificate Generator."""
+"""Structured JSON logging configuration for Bulk Certificate Generator."""
 
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from app.core.config import get_settings
+
+
+class JsonFormatter(logging.Formatter):
+    """Custom logging formatter outputting valid JSON records."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_payload)
 
 
 def setup_logging() -> None:
@@ -10,13 +27,7 @@ def setup_logging() -> None:
     settings = get_settings()
     log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
 
-    log_format = (
-        '{"timestamp": "%(asctime)s", "level": "%(levelname)s", '
-        '"logger": "%(name)s", "message": "%(message)s"}'
-    )
-
-    formatter = logging.Formatter(fmt=log_format, datefmt="%Y-%m-%dT%H:%M:%S%z")
-
+    formatter = JsonFormatter()
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
 

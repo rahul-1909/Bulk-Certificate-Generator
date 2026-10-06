@@ -10,12 +10,12 @@ from app.models.job import CertificateStatus, JobStatus
 class RecipientInput(BaseModel):
     """Schema for individual recipient input in a job creation request."""
 
-    name: str = Field(..., description="Full name of the certificate recipient")
-    email: str = Field(..., description="Email address of the certificate recipient")
+    name: Optional[str] = Field(default=None, description="Full name of the certificate recipient")
+    email: Optional[str] = Field(default=None, description="Email address of the certificate recipient")
     role: Optional[str] = Field(default=None, description="Optional role or distinction")
-    score: Optional[str] = Field(default=None, description="Optional score, grade, or metric")
+    score: Optional[Any] = Field(default=None, description="Optional score, grade, or metric")
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
 
 
 class JobCreate(BaseModel):
@@ -90,6 +90,7 @@ class CertificateItemResponse(BaseModel):
     role: Optional[str] = None
     score: Optional[str] = None
     status: CertificateStatus
+    failure_type: Optional[str] = None
     error_message: Optional[str] = None
     download_url: Optional[str] = None
     created_at: datetime

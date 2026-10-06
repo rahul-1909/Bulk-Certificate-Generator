@@ -5,6 +5,7 @@ import os
 import zipfile
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import FileResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.models.job import CertificateRecipient, CertificateStatus, Job
@@ -76,14 +77,11 @@ def download_all_certificates(
             detail=f"Job with ID '{job_id}' not found.",
         )
 
-    successful_recipients = (
-        db.query(CertificateRecipient)
-        .filter(
-            CertificateRecipient.job_id == job_id,
-            CertificateRecipient.status == CertificateStatus.SUCCESS,
-        )
-        .all()
+    stmt = select(CertificateRecipient).where(
+        CertificateRecipient.job_id == job_id,
+        CertificateRecipient.status == CertificateStatus.SUCCESS,
     )
+    successful_recipients = list(db.scalars(stmt).all())
 
     valid_files = [
         r.certificate_file_path

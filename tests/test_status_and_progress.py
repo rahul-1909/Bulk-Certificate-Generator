@@ -72,3 +72,36 @@ def test_job_pagination(client: TestClient):
     p3_data = page3_res.json()
     assert len(p3_data["recipients"]) == 5
     assert p3_data["recipients"][-1]["name"] == "Student 14"
+
+
+def test_rerunning_process_job_background_is_idempotent(client: TestClient):
+    """Verify that re-running process_job_background on a completed job does not alter counts or duplicate files."""
+    from app.services.job_processor import process_job_background
+
+    payload = {
+        "title": "Idempotency Test Cohort",
+        "issuer": "Academy",
+        "issue_date": "2026-10-07",
+        "recipients": [
+            {"name": "Learner 1", "email": "learner1@example.com"},
+            {"name": "Learner 2", "email": "learner2@example.com"},
+        ],
+    }
+    create_res = client.post("/api/v1/jobs", json=payload)
+    job_id = create_res.json()["job_id"]
+
+    # Initial check
+    status1 = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert status1["status"] == "completed"
+    assert status1["succeeded_count"] == 2
+    assert status1["failed_count"] == 0
+
+    # Execute process_job_background a second time
+    process_job_background(job_id)
+
+    # Re-check status: counts must remain identical
+    status2 = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert status2["status"] == "completed"
+    assert status2["succeeded_count"] == 2
+    assert status2["failed_count"] == 0
+    assert status2["pending_count"] == 0
