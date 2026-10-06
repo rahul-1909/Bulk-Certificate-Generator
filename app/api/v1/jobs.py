@@ -294,13 +294,17 @@ def retry_failed_certificates(
     )
     generation_failed_recipients = list(db.scalars(gen_failed_stmt).all())
 
-    # 3. Permanent validation failures (remain failed)
-    val_failed_stmt = select(CertificateRecipient).where(
-        CertificateRecipient.job_id == job_id,
-        CertificateRecipient.status == CertificateStatus.FAILED,
-        CertificateRecipient.failure_type == FailureType.VALIDATION,
+    # 3. Any failed recipients not in generation_failed are permanently invalid
+    total_failed_stmt = (
+        select(func.count())
+        .select_from(CertificateRecipient)
+        .where(
+            CertificateRecipient.job_id == job_id,
+            CertificateRecipient.status == CertificateStatus.FAILED,
+        )
     )
-    permanently_invalid_count = len(list(db.scalars(val_failed_stmt).all()))
+    total_failed = db.scalar(total_failed_stmt) or 0
+    permanently_invalid_count = total_failed - len(generation_failed_recipients)
 
     total_to_process = len(stuck_pending_recipients) + len(generation_failed_recipients)
 
