@@ -1,0 +1,33 @@
+{
+  "title": "Advanced Python Engineering",
+  "issuer": "Tech Institute",
+  "issue_date": "2026-10-07",
+  "recipients": [
+    {
+      "name": "Alice Chen",
+      "email": "alice@example.com",
+      "role": "Distinction",
+      "score": "96%"
+    },
+    {
+      "name": "Bob Miller",
+      "email": "bob@example.com",
+      "role": "Graduate",
+      "score": "88%"
+    },
+    {
+      "name": "Charlie Davis",
+      "email": "charlie@example.com",
+      "role": "Participant",
+      "score": "91%"
+    },
+    {
+      "name": "   ",
+      "email": "blank@example.com"
+    },
+    {
+      "name": "Eve Stone",
+      "email": "invalid-email-format"
+    }
+  ]
+}
