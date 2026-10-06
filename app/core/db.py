@@ -35,6 +35,18 @@ SessionLocal = sessionmaker(
 )
 
 
+def set_engine_and_sessionmaker(new_engine) -> None:
+    """Rebind the global engine and SessionLocal, used in test isolation."""
+    global engine, SessionLocal
+    engine = new_engine
+    SessionLocal = sessionmaker(
+        bind=new_engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+
 def init_db() -> None:
     """Create all database tables on application startup."""
     # Ensure all models are imported before calling create_all
