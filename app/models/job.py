@@ -44,6 +44,13 @@ class CertificateStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class FailureType:
+    """Why a recipient failed, so retry can tell fixable errors from bad input."""
+
+    VALIDATION = "validation"  # bad input (blank name, duplicate email, ...): never retried
+    GENERATION = "generation"  # system error while rendering the PDF: safe to retry
+
+
 class Job(Base):
     """Database model representing a bulk certificate generation job."""
 

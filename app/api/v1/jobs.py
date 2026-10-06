@@ -2,14 +2,20 @@
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Set
+from typing import Optional, Set
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.core.logging import get_logger
-from app.models.job import CertificateRecipient, CertificateStatus, Job, JobStatus
+from app.models.job import (
+    CertificateRecipient,
+    CertificateStatus,
+    FailureType,
+    Job,
+    JobStatus,
+)
 from app.schemas.job import (
     CertificateItemResponse,
     JobCreate,
@@ -23,7 +29,26 @@ from app.services.validator import validate_recipient
 logger = get_logger(__name__)
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
-STALE_AFTER = timedelta(minutes=5)
+# A job whose last update is newer than this is assumed to still have a live worker.
+# The worker commits after every recipient, so a healthy job keeps refreshing updated_at.
+ACTIVE_JOB_WINDOW = timedelta(minutes=5)
+
+
+def _clip(value: Optional[str], limit: int) -> Optional[str]:
+    """Strip and truncate text so it always fits its database column (PostgreSQL is strict)."""
+    if value is None:
+        return None
+    return str(value).strip()[:limit]
+
+
+def _is_job_active(job: Job) -> bool:
+    """True if the job is pending/processing and was updated recently (worker likely alive)."""
+    if job.status not in (JobStatus.PENDING, JobStatus.PROCESSING):
+        return False
+    updated = job.updated_at
+    if updated.tzinfo is None:  # SQLite returns naive datetimes
+        updated = updated.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - updated < ACTIVE_JOB_WINDOW
 
 
 @router.post(
@@ -68,35 +93,30 @@ def create_job(
     for rec_in in payload.recipients:
         is_valid, error_reason = validate_recipient(rec_in, seen_emails)
 
-        # Truncate stored values to column maximums to ensure clean PostgreSQL compatibility
-        clean_name = (rec_in.name or "").strip()[:255]
-        clean_email = (rec_in.email or "").strip()[:255]
-        clean_role = rec_in.role.strip()[:255] if rec_in.role else None
-        clean_score = str(rec_in.score).strip()[:100] if rec_in.score is not None else None
-
         if is_valid:
             valid_recipients_count += 1
             recipient = CertificateRecipient(
                 job_id=job.id,
-                name=clean_name,
-                email=clean_email,
-                role=clean_role,
-                score=clean_score,
+                name=_clip(rec_in.name, 255) or "",
+                email=_clip(rec_in.email, 255) or "",
+                role=_clip(rec_in.role, 255) or None,
+                score=_clip(rec_in.score, 100) or None,
                 status=CertificateStatus.PENDING,
-                failure_type=None,
                 error_message=None,
             )
         else:
             invalid_recipients_count += 1
             recipient = CertificateRecipient(
                 job_id=job.id,
-                name=clean_name,
-                email=clean_email,
-                role=clean_role,
-                score=clean_score,
+                # Truncate: invalid rows may hold over-long values that would overflow
+                # the column (and crash the whole request) on PostgreSQL.
+                name=_clip(rec_in.name, 255) or "",
+                email=_clip(rec_in.email, 255) or "",
+                role=_clip(rec_in.role, 255) or None,
+                score=_clip(rec_in.score, 100) or None,
                 status=CertificateStatus.FAILED,
-                failure_type="validation",
                 error_message=error_reason,
+                failure_type=FailureType.VALIDATION,
             )
         db.add(recipient)
 
@@ -250,12 +270,10 @@ def retry_failed_certificates(
             detail=f"Job with ID '{job_id}' not found.",
         )
 
-    # Staleness check: prevent duplicate workers if the job is actively being processed
-    updated = job.updated_at
-    if updated.tzinfo is None:
-        updated = updated.replace(tzinfo=timezone.utc)
-    is_active = job.status in (JobStatus.PENDING, JobStatus.PROCESSING)
-    if is_active and (datetime.now(timezone.utc) - updated) < STALE_AFTER:
+    # Refuse while a worker is (probably) still running: a second worker would process the
+    # same recipients and double-count. A job stuck after a crash has a stale updated_at,
+    # so it can still be resumed.
+    if _is_job_active(job):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Job is currently being processed. Retry once it finishes or becomes stale.",
@@ -272,7 +290,7 @@ def retry_failed_certificates(
     gen_failed_stmt = select(CertificateRecipient).where(
         CertificateRecipient.job_id == job_id,
         CertificateRecipient.status == CertificateStatus.FAILED,
-        CertificateRecipient.failure_type == "generation",
+        CertificateRecipient.failure_type == FailureType.GENERATION,
     )
     generation_failed_recipients = list(db.scalars(gen_failed_stmt).all())
 
@@ -280,7 +298,7 @@ def retry_failed_certificates(
     val_failed_stmt = select(CertificateRecipient).where(
         CertificateRecipient.job_id == job_id,
         CertificateRecipient.status == CertificateStatus.FAILED,
-        CertificateRecipient.failure_type == "validation",
+        CertificateRecipient.failure_type == FailureType.VALIDATION,
     )
     permanently_invalid_count = len(list(db.scalars(val_failed_stmt).all()))
 

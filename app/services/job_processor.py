@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from app.core.db import get_db_session
 from app.core.logging import get_logger
-from app.models.job import CertificateRecipient, CertificateStatus, Job, JobStatus
+from app.models.job import (
+    CertificateRecipient,
+    CertificateStatus,
+    FailureType,
+    Job,
+    JobStatus,
+)
 from app.services.pdf_generator import generate_certificate_pdf
 
 logger = get_logger(__name__)
@@ -98,7 +104,7 @@ def process_job_background(job_id: str) -> None:
                     str(exc),
                 )
                 recipient.status = CertificateStatus.FAILED
-                recipient.failure_type = "generation"
+                recipient.failure_type = FailureType.GENERATION
                 recipient.error_message = (
                     "Certificate generation failed due to an internal rendering or storage error."
                 )
