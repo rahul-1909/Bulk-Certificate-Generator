@@ -15,11 +15,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
-COPY app/ ./app/
+# Create non-root user and group for security
+RUN groupadd -g 10001 appgroup && \
+    useradd -u 10001 -g appgroup -s /bin/sh -m appuser
 
-# Create certificates storage directory
-RUN mkdir -p /app/storage/certificates
+# Copy application source code and pytest configuration
+COPY app/ ./app/
+COPY pytest.ini .
+
+# Create certificates storage directory and assign ownership
+RUN mkdir -p /app/storage/certificates && \
+    chown -R appuser:appgroup /app
+
+# Switch to non-root user
+USER appuser
 
 # Expose default API port
 EXPOSE 8000

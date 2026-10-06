@@ -57,3 +57,31 @@ def validate_recipient(
     seen_emails.add(normalized_email)
 
     return True, None
+
+
+def is_eligible_for_generation(
+    name: str,
+    email: str,
+    role: Optional[str] = None,
+    score: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Check if recipient attributes meet basic validity criteria to attempt PDF generation.
+
+    Distinguishes permanent validation failures (e.g. blank name or malformed email)
+    from transient system errors.
+    """
+    if not name or not name.strip():
+        return False, "Recipient name cannot be blank."
+    if len(name) > MAX_STRING_LENGTH:
+        return False, f"Recipient name exceeds {MAX_STRING_LENGTH} characters."
+    if not email or len(email) > MAX_STRING_LENGTH:
+        return False, f"Email exceeds {MAX_STRING_LENGTH} characters."
+    if role and len(role) > MAX_STRING_LENGTH:
+        return False, f"Role exceeds {MAX_STRING_LENGTH} characters."
+    if score and len(score) > MAX_SCORE_LENGTH:
+        return False, f"Score exceeds {MAX_SCORE_LENGTH} characters."
+    try:
+        validate_email(email.strip(), check_deliverability=False)
+    except Exception as exc:
+        return False, f"Invalid email address: {str(exc)}"
+    return True, None

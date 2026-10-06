@@ -1,6 +1,6 @@
 # Bulk Certificate Generator (Backend API)
 
-Enterprise-grade, asynchronous backend API designed to handle bulk certificate generation requests for large recipient cohorts. Built with **FastAPI**, **SQLAlchemy 2.x**, **Pydantic v2**, and **ReportLab**.
+Asynchronous backend API designed to handle bulk certificate generation requests for large recipient cohorts. Built with **FastAPI**, **SQLAlchemy 2.x**, **Pydantic v2**, and **ReportLab**.
 
 ---
 
@@ -13,7 +13,7 @@ Key capabilities:
 - **Resilient Failure Isolation**: Per-recipient validation or PDF generation errors (such as blank names, invalid emails, duplicates, or corrupt data) never abort the overall batch. Invalid entries are recorded as failed with explicit diagnostic reasons, while valid recipients proceed to completion.
 - **Granular Real-Time Status Tracking**: Job and per-recipient progression statuses (`pending`, `processing`, `completed`, `completed_with_errors`, `failed`) are committed per recipient so clients can monitor progress live.
 - **Multi-Format Retrieval**: Supports single PDF certificate downloads and full-batch ZIP archive downloads with path traversal security.
-- **Built-in Resilience**: Includes an endpoint to retry failed certificates without regenerating already completed certificates.
+- **Built-in Resilience**: Includes an endpoint to retry failed certificates and resume interrupted jobs without regenerating already completed certificates.
 
 ---
 
@@ -66,6 +66,17 @@ Start the Uvicorn server using the standard command:
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+### Running with Docker
+The included Dockerfile runs as a non-root user (`appuser`). When running in a container, mount persistent host volumes for the SQLite database and generated certificates so data persists across container lifecycles:
+
+```bash
+docker build -t bulk-certificate-generator .
+docker run -p 8000:8000 \
+  -v $(pwd)/storage/certificates:/app/storage/certificates \
+  -v $(pwd)/certificates.db:/app/certificates.db \
+  bulk-certificate-generator
+```
+
 Once running, access the interactive API documentation at:
 - **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
@@ -81,7 +92,7 @@ Run the complete test suite with `pytest`:
 pytest -v
 ```
 
-To run with verbose output and coverage reporting:
+To run with compact traceback output:
 ```bash
 pytest -v --tb=short
 ```
@@ -313,9 +324,10 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
   - Background workers NEVER reuse the caller's request DB session.
   - A dedicated context manager `with get_db_session() as db:` creates an independent database session for the background thread, avoiding session concurrency violations and connection pool leaks.
 - **Limitations**:
-  - In-process background tasks run in the memory of the web server worker. If the container or server process restarts during execution, jobs in the `processing` state will not resume automatically unless picked up by a recovery reaper.
+  - In-process background tasks run in the memory of the web server worker. If the container or server process restarts during execution, jobs currently in the `processing` state will remain in that state and will not automatically resume on boot.
+  - However, the job is not permanently broken: calling `POST /api/v1/jobs/{job_id}/retry` inspects the job, finds any interrupted recipients left in `pending`, and safely resumes generation.
 - **Production Architecture**:
-  - In a high-volume production environment, we recommend an external distributed task queue such as **Celery** or **RQ** backed by **Redis** or **RabbitMQ**. Tasks can be partitioned into recipient chunks, scaled horizontally across dedicated worker nodes, and tracked with dead-letter queues.
+  - In a high-volume production environment, we recommend an external distributed task queue such as **Celery** or **Temporal** backed by **Redis** or **RabbitMQ**. Tasks can be partitioned into recipient chunks, worker nodes can scale horizontally, and lost tasks can be automatically redelivered using visibility timeouts and worker heartbeats.
 
 ### 4. Failure Isolation
 - **Per-Recipient Fault Boundaries**:
@@ -339,9 +351,12 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
 - **Security Guardrail**: The resolved target path is checked to guarantee that it is strictly located within the configured storage directory, preventing directory traversal (`../../`).
 - **Cleanup & Streaming**: ZIP retrieval aggregates files directly from storage into an in-memory streaming archive without temporary file clutter.
 
-### 7. Idempotency & Re-runnability
+### 7. Idempotency, Re-runnability & Retry Strategy
 - Before generating a certificate, the processor verifies if the recipient already has a valid non-empty PDF file on disk. If so, it marks the recipient as successful without regenerating.
-- The `POST /api/v1/jobs/{job_id}/retry` endpoint resets failed certificates back to `pending` and re-triggers background processing, seamlessly handling transient faults.
+- The `POST /api/v1/jobs/{job_id}/retry` endpoint provides intentional, resilient recovery:
+  - **Interrupted Pending Recipients**: Resumes generation for any recipients left in `pending` (such as after an unexpected server restart or container kill).
+  - **Transient Generation Failures**: Identifies recipients that failed due to transient system or rendering errors, resets their status to `pending`, and queues regeneration.
+  - **Permanent Validation Failures**: Excludes permanently invalid recipients (e.g., blank name or invalid email format). Because their underlying input is invalid, re-attempting generation would merely produce a blank or corrupt certificate, so they remain `failed` with their validation reason intact.
 
 ### 8. What I Would Improve in Production
 1. **Distributed Task Queue**: Replace in-process `BackgroundTasks` with Celery or Temporal backed by Redis/RabbitMQ.

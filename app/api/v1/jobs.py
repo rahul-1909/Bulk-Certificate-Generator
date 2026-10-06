@@ -216,14 +216,20 @@ def get_job(
     response_model=JobRetryResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Retry failed certificates for a job",
-    description="Resets all failed recipients for this job to pending and queues background regeneration.",
+    description=(
+        "Resets failed certificates that suffered transient errors to pending, "
+        "resumes any interrupted pending recipients (e.g. after server restart), "
+        "and queues regeneration while preserving permanent validation errors."
+    ),
 )
 def retry_failed_certificates(
     job_id: str,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> JobRetryResponse:
-    """Reset failed recipients in a job and re-queue certificate generation."""
+    """Reset transiently failed recipients and resume pending ones after interruption."""
+    from app.services.validator import is_eligible_for_generation
+
     settings = get_settings()
     job = db.get(Job, job_id)
     if not job:
@@ -232,7 +238,18 @@ def retry_failed_certificates(
             detail=f"Job with ID '{job_id}' not found.",
         )
 
-    failed_recipients = (
+    # 1. Check for recipients left in pending status (e.g. if worker was interrupted mid-job by a crash)
+    stuck_pending_recipients = (
+        db.query(CertificateRecipient)
+        .filter(
+            CertificateRecipient.job_id == job_id,
+            CertificateRecipient.status == CertificateStatus.PENDING,
+        )
+        .all()
+    )
+
+    # 2. Check for failed recipients whose data is valid (i.e. transient generation errors)
+    all_failed_recipients = (
         db.query(CertificateRecipient)
         .filter(
             CertificateRecipient.job_id == job_id,
@@ -241,21 +258,40 @@ def retry_failed_certificates(
         .all()
     )
 
-    if not failed_recipients:
+    eligible_to_retry = []
+    permanently_invalid_count = 0
+    for r in all_failed_recipients:
+        is_eligible, _ = is_eligible_for_generation(r.name, r.email, r.role, r.score)
+        if is_eligible:
+            eligible_to_retry.append(r)
+        else:
+            permanently_invalid_count += 1
+
+    total_to_process = len(stuck_pending_recipients) + len(eligible_to_retry)
+
+    if total_to_process == 0:
+        if permanently_invalid_count > 0:
+            msg = (
+                f"No retryable certificates found. {permanently_invalid_count} recipient(s) "
+                f"failed permanent validation (blank name or invalid email) and cannot be generated."
+            )
+        else:
+            msg = "No pending or failed certificates to retry for this job."
         return JobRetryResponse(
             job_id=job.id,
             status=job.status,
             retried_count=0,
-            message="No failed certificates to retry for this job.",
+            message=msg,
         )
 
-    retried_count = len(failed_recipients)
-    for r in failed_recipients:
+    # Reset eligible failed recipients to pending
+    for r in eligible_to_retry:
         r.status = CertificateStatus.PENDING
         r.error_message = None
 
-    job.pending_count += retried_count
-    job.failed_count = max(0, job.failed_count - retried_count)
+    # Recalculate pending and failed counts
+    job.pending_count = total_to_process
+    job.failed_count = permanently_invalid_count
     job.status = JobStatus.PENDING
 
     db.commit()
@@ -267,9 +303,13 @@ def retry_failed_certificates(
     else:
         background_tasks.add_task(process_job_background, job.id)
 
+    msg = f"Queued retry/resumption for {total_to_process} certificate(s)."
+    if permanently_invalid_count > 0:
+        msg += f" ({permanently_invalid_count} permanently invalid recipient(s) excluded)."
+
     return JobRetryResponse(
         job_id=job.id,
         status=job.status,
-        retried_count=retried_count,
-        message=f"Queued retry for {retried_count} failed certificate(s).",
+        retried_count=total_to_process,
+        message=msg,
     )
