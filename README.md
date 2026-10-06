@@ -67,13 +67,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### Running with Docker
-The included Dockerfile runs as a non-root user (`appuser`). When running in a container, mount persistent host volumes for the SQLite database and generated certificates so data persists across container lifecycles:
+The included Dockerfile runs as a non-root user (`appuser`). To persist data across container lifecycles without host permission or single-file bind mount issues, use a named Docker volume mapped to `/data`:
 
+**Linux / macOS (Bash)**:
 ```bash
 docker build -t bulk-certificate-generator .
-docker run -p 8000:8000 \
-  -v $(pwd)/storage/certificates:/app/storage/certificates \
-  -v $(pwd)/certificates.db:/app/certificates.db \
+docker run -p 8000:8000 -v certgen-data:/data \
+  -e DATABASE_URL=sqlite:////data/certificates.db \
+  -e CERTIFICATES_STORAGE_DIR=/data/certificates \
+  bulk-certificate-generator
+```
+
+**Windows (PowerShell)**:
+```powershell
+docker build -t bulk-certificate-generator .
+docker run -p 8000:8000 -v certgen-data:/data `
+  -e DATABASE_URL=sqlite:////data/certificates.db `
+  -e CERTIFICATES_STORAGE_DIR=/data/certificates `
   bulk-certificate-generator
 ```
 
@@ -307,7 +317,7 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
 
 ### 2. Database Choice & Schema
 - **Relational ORM**: SQLAlchemy 2.0 using modern 2.0 declarative models (`DeclarativeBase`) and 2.0 style queries (`db.scalars(select(...))`).
-- **Default Database**: SQLite by default (`sqlite:///./certificates.db`) with `check_same_thread=False` and WAL mode enabled (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) to eliminate write lock contention. Driven entirely by the `DATABASE_URL` environment variable, enabling direct drops into PostgreSQL without code modification.
+- **Default Database**: SQLite by default (`sqlite:///./certificates.db`) with `check_same_thread=False` and WAL mode enabled (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) to reduce write lock contention (SQLite still permits one concurrent writer at a time, but allows concurrent readers during writes). Configured conditionally inside an `event.listens_for(engine, "connect")` listener exclusively for SQLite engines to maintain clean drop-in compatibility with PostgreSQL. Driven entirely by the `DATABASE_URL` environment variable.
 - **Table Creation vs. Alembic Migrations**:
   - Clean table initialization on startup (`Base.metadata.create_all`) is selected.
   - *Justification*: For a self-contained, domain-focused service with an established schema, running `create_all` during FastAPI's application lifespan provides zero-friction deployment with zero external CLI orchestration needed for initial boots.
@@ -349,8 +359,8 @@ curl -X GET http://localhost:8000/api/v1/jobs/254290cd-9089-4452-a5a2-b2caa47e71
 
 ### 6. File Storage, Layout & Path Traversal Security
 - **Directory**: Configurable via `CERTIFICATES_STORAGE_DIR` (defaults to `./storage/certificates`).
-- **Sanitization & Traversal Guard**: Names are sanitized to alphanumeric, dash, and underscore characters (`re.sub(r"[^\w\-]", "_", ...)`). The target path is verified using Python 3.11's `file_path.is_relative_to(target_dir)` to prevent directory traversal (`../../`).
-- **PDF Layout & Typography**: Recipient names are auto-scaled dynamically if long so they fit within the A4 landscape borders without overflowing. Note: The predefined template uses ReportLab's standard Helvetica font; rendering non-Latin scripts (e.g. Telugu, Devanagari, Arabic, CJK) requires registering a TrueType Unicode font such as Google Noto Sans.
+- **Sanitization & Traversal Guard**: Names are sanitized to alphanumeric, dash, and underscore characters (`re.sub(r"[^\w\-]", "_", ...)`). The target path is verified using Python 3.9+'s `file_path.is_relative_to(target_dir)` to prevent directory traversal (`../../`).
+- **PDF Layout & Typography**: All dynamic text elements (recipient name, course/event title, issuer organization, role, and score) are dynamically auto-scaled and width-constrained with defensive font scaling (`_fit_font_size`) and ellipsis bounds (`_fit_text_to_width`) so even maximum-length 255-character fields fit cleanly within A4 landscape margins without overflowing or corrupting the layout. Note: The predefined template uses ReportLab's standard Helvetica font; rendering non-Latin scripts (e.g. Telugu, Devanagari, Arabic, CJK) requires registering a TrueType Unicode font such as Google Noto Sans.
 - **ZIP Packaging**: ZIP archives are assembled in memory using Python's `zipfile` module. For multi-gigabyte production archives, an asynchronous disk-spooled stream would be preferred to constrain peak memory usage.
 
 ### 7. Idempotency, Re-runnability & Retry Strategy

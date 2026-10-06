@@ -19,13 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd -g 10001 appgroup && \
     useradd -u 10001 -g appgroup -s /bin/sh -m appuser
 
-# Copy application source code and pytest configuration
+# Copy application source code
 COPY app/ ./app/
-COPY pytest.ini .
 
-# Create certificates storage directory and assign ownership
-RUN mkdir -p /app/storage/certificates && \
-    chown -R appuser:appgroup /app
+# Create data and certificates storage directories and assign ownership
+RUN mkdir -p /app/storage/certificates /data && \
+    chown -R appuser:appgroup /app /data
 
 # Switch to non-root user
 USER appuser

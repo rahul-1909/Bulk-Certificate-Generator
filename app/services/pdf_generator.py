@@ -24,6 +24,37 @@ def sanitize_filename(name: str) -> str:
     return cleaned[:60]
 
 
+def _fit_font_size(
+    pdf: canvas.Canvas,
+    text: str,
+    font_name: str,
+    initial_size: int,
+    min_size: int,
+    max_width: float,
+) -> int:
+    """Dynamically scale down font size until text fits within max_width."""
+    size = initial_size
+    while size > min_size and pdf.stringWidth(text, font_name, size) > max_width:
+        size -= 1
+    return size
+
+
+def _fit_text_to_width(
+    pdf: canvas.Canvas,
+    text: str,
+    font_name: str,
+    font_size: int,
+    max_width: float,
+) -> str:
+    """Truncate text with ellipsis if it still exceeds max_width at the minimum font size."""
+    if pdf.stringWidth(text, font_name, font_size) <= max_width:
+        return text
+    truncated = text
+    while len(truncated) > 3 and pdf.stringWidth(truncated + "...", font_name, font_size) > max_width:
+        truncated = truncated[:-1]
+    return truncated + "..."
+
+
 def generate_certificate_pdf(
     recipient_id: str,
     recipient_name: str,
@@ -66,6 +97,7 @@ def generate_certificate_pdf(
 
     # A4 Landscape dimensions in points (841.89 x 595.27)
     width, height = landscape(A4)
+    max_text_width = width - 160
 
     pdf = canvas.Canvas(str(file_path), pagesize=landscape(A4))
     pdf.setTitle(f"Certificate - {recipient_name}")
@@ -93,10 +125,12 @@ def generate_certificate_pdf(
             pdf.setFillColor(colors.HexColor("#D69E2E"))
             pdf.circle(x, y, 4, stroke=0, fill=1)
 
-    # 3. Header: Issuing organization
+    # 3. Header: Issuing organization (auto-scaled and bounded)
+    issuer_font_size = _fit_font_size(pdf, issuer.upper(), "Helvetica-Bold", 12, 8, max_text_width)
+    display_issuer_header = _fit_text_to_width(pdf, issuer.upper(), "Helvetica-Bold", issuer_font_size, max_text_width)
     pdf.setFillColor(colors.HexColor("#4A5568"))
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawCentredString(width / 2, height - 85, issuer.upper())
+    pdf.setFont("Helvetica-Bold", issuer_font_size)
+    pdf.drawCentredString(width / 2, height - 85, display_issuer_header)
 
     # 4. Certificate Main Title
     pdf.setFillColor(colors.HexColor("#0F294A"))
@@ -109,24 +143,21 @@ def generate_certificate_pdf(
     pdf.drawCentredString(width / 2, height - 170, "THIS CERTIFICATE IS PROUDLY PRESENTED TO")
 
     # 6. Recipient Name (auto-scaled to fit landscape bounds without overflow)
-    max_name_width = width - 160
-    font_size = 26
-    while font_size > 12 and pdf.stringWidth(recipient_name, "Helvetica-Bold", font_size) > max_name_width:
-        font_size -= 2
-
+    name_font_size = _fit_font_size(pdf, recipient_name, "Helvetica-Bold", 26, 12, max_text_width)
+    display_name = _fit_text_to_width(pdf, recipient_name, "Helvetica-Bold", name_font_size, max_text_width)
     pdf.setFillColor(colors.HexColor("#1A202C"))
-    pdf.setFont("Helvetica-Bold", font_size)
-    pdf.drawCentredString(width / 2, height - 220, recipient_name)
+    pdf.setFont("Helvetica-Bold", name_font_size)
+    pdf.drawCentredString(width / 2, height - 220, display_name)
 
     # Underline below recipient name
-    name_width = pdf.stringWidth(recipient_name, "Helvetica-Bold", font_size)
+    name_width = pdf.stringWidth(display_name, "Helvetica-Bold", name_font_size)
     line_start = (width - min(name_width + 40, width - 200)) / 2
     line_end = line_start + min(name_width + 40, width - 200)
     pdf.setStrokeColor(colors.HexColor("#D69E2E"))
     pdf.setLineWidth(2)
     pdf.line(line_start, height - 232, line_end, height - 232)
 
-    # 7. Achievement description & title
+    # 7. Achievement description & title (auto-scaled to fit landscape bounds)
     pdf.setFillColor(colors.HexColor("#4A5568"))
     pdf.setFont("Helvetica", 12)
     pdf.drawCentredString(
@@ -135,11 +166,13 @@ def generate_certificate_pdf(
         "for successfully completing the requirements and demonstrating excellence in",
     )
 
+    title_font_size = _fit_font_size(pdf, title, "Helvetica-Bold", 18, 9, max_text_width)
+    display_title = _fit_text_to_width(pdf, title, "Helvetica-Bold", title_font_size, max_text_width)
     pdf.setFillColor(colors.HexColor("#1E3A8A"))
-    pdf.setFont("Helvetica-Bold", 18)
-    pdf.drawCentredString(width / 2, height - 295, title)
+    pdf.setFont("Helvetica-Bold", title_font_size)
+    pdf.drawCentredString(width / 2, height - 295, display_title)
 
-    # 8. Optional distinctions (Role and/or Score)
+    # 8. Optional distinctions (Role and/or Score, auto-scaled to fit bounds)
     extra_details = []
     if role:
         extra_details.append(f"Role: {role}")
@@ -148,9 +181,11 @@ def generate_certificate_pdf(
 
     if extra_details:
         details_text = "  |  ".join(extra_details)
+        details_font_size = _fit_font_size(pdf, details_text, "Helvetica-Oblique", 11, 8, max_text_width)
+        display_details = _fit_text_to_width(pdf, details_text, "Helvetica-Oblique", details_font_size, max_text_width)
         pdf.setFillColor(colors.HexColor("#2D3748"))
-        pdf.setFont("Helvetica-Oblique", 11)
-        pdf.drawCentredString(width / 2, height - 330, details_text)
+        pdf.setFont("Helvetica-Oblique", details_font_size)
+        pdf.drawCentredString(width / 2, height - 330, display_details)
 
     # 9. Footer: Left side (Date & Certificate ID)
     pdf.setFillColor(colors.HexColor("#4A5568"))
@@ -166,9 +201,11 @@ def generate_certificate_pdf(
     pdf.setLineWidth(1)
     pdf.line(sig_line_x, 115, sig_line_x + 190, 115)
 
+    sig_font_size = _fit_font_size(pdf, issuer, "Helvetica-Bold", 10, 7, 180)
+    display_sig = _fit_text_to_width(pdf, issuer, "Helvetica-Bold", sig_font_size, 180)
     pdf.setFillColor(colors.HexColor("#1A202C"))
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawCentredString(sig_line_x + 95, 98, issuer)
+    pdf.setFont("Helvetica-Bold", sig_font_size)
+    pdf.drawCentredString(sig_line_x + 95, 98, display_sig)
     pdf.setFillColor(colors.HexColor("#718096"))
     pdf.setFont("Helvetica", 9)
     pdf.drawCentredString(sig_line_x + 95, 84, "Authorized Representative")

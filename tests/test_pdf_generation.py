@@ -68,3 +68,21 @@ def test_filename_sanitization_prevents_path_traversal():
     blank_input = "   ...   "
     sanitized_blank = sanitize_filename(blank_input)
     assert sanitized_blank == "recipient"
+
+
+def test_pdf_generation_with_maximum_length_fields(tmp_path: Path):
+    """Verify that 255-char title, issuer, role, score, and long name render cleanly without overflowing."""
+    pdf_path = generate_certificate_pdf(
+        recipient_id="max-length-id-12345",
+        recipient_name="A" * 200,
+        title="T" * 255,
+        issuer="I" * 255,
+        issue_date="2026-10-07",
+        role="R" * 255,
+        score="S" * 100,
+        output_dir=tmp_path,
+    )
+    assert os.path.exists(pdf_path)
+    assert os.path.getsize(pdf_path) > 500
+    reader = pypdf.PdfReader(pdf_path)
+    assert len(reader.pages) == 1
